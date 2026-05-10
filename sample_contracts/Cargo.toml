@@ -10,6 +10,4 @@ oxyde_sdk = { path = "../oxyde_sdk" }
 oxyde_codegen = { path = "../oxyde_codegen" }
 
 [dev-dependencies]
-revm = { version = "38", default-features = false, features = ["std"] }
-alloy-primitives = "1"
 serde_json = "1"

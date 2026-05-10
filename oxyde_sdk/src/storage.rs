@@ -39,3 +39,21 @@ impl<K, V> StorageMap<K, V> {
 
     pub fn set_value(&mut self, _key: &K, _value: V) {}
 }
+
+/// Marker type for a nested storage mapping (double map). Used by the codegen to identify
+/// contract storage fields. Has no runtime behavior.
+pub struct StorageDoubleMap<K1, K2, V> {
+    _phantom: PhantomData<(K1, K2, V)>,
+}
+
+impl<K1, K2, V> StorageDoubleMap<K1, K2, V> {
+    pub fn new(_key: &str) -> Self {
+        StorageDoubleMap { _phantom: PhantomData }
+    }
+
+    pub fn get(&self, _k1: &K1, _k2: &K2) -> V where V: Default {
+        V::default()
+    }
+
+    pub fn set_value(&mut self, _k1: &K1, _k2: &K2, _value: V) {}
+}

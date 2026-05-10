@@ -1668,6 +1668,7 @@ name = "oxyde_sdk"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "oxyde_macros",
  "revm",
  "thiserror",
 ]
@@ -2354,10 +2355,8 @@ dependencies = [
 name = "sample_contracts"
 version = "0.1.0"
 dependencies = [
- "alloy-primitives",
  "oxyde_codegen",
  "oxyde_sdk",
- "revm",
  "serde_json",
 ]
 

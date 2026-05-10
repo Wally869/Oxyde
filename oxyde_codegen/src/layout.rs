@@ -2,6 +2,7 @@
 pub enum StorageFieldKind {
     Item,
     Map,
+    DoubleMap,
 }
 
 #[derive(Debug, Clone)]
@@ -10,7 +11,7 @@ pub struct StorageField {
     pub slot: u32,
     pub kind: StorageFieldKind,
     pub value_type: String,
-    pub key_type: Option<String>,
+    pub key_types: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +64,7 @@ impl StorageLayout {
                         slot,
                         kind: StorageFieldKind::Item,
                         value_type: args[0].clone(),
-                        key_type: None,
+                        key_types: vec![],
                     }
                 }
                 "StorageMap" => {
@@ -78,13 +79,29 @@ impl StorageLayout {
                         name: field_name,
                         slot,
                         kind: StorageFieldKind::Map,
-                        key_type: Some(args[0].clone()),
+                        key_types: vec![args[0].clone()],
                         value_type: args[1].clone(),
+                    }
+                }
+                "StorageDoubleMap" => {
+                    if args.len() != 3 {
+                        return Err(format!(
+                            "field '{}': StorageDoubleMap expects 3 generic arguments, got {}",
+                            field_name,
+                            args.len()
+                        ));
+                    }
+                    StorageField {
+                        name: field_name,
+                        slot,
+                        kind: StorageFieldKind::DoubleMap,
+                        key_types: vec![args[0].clone(), args[1].clone()],
+                        value_type: args[2].clone(),
                     }
                 }
                 other => {
                     return Err(format!(
-                        "field '{}': unsupported storage type '{}' — expected StorageItem or StorageMap",
+                        "field '{}': unsupported storage type '{}' — expected StorageItem, StorageMap, or StorageDoubleMap",
                         field_name, other
                     ));
                 }
@@ -167,7 +184,7 @@ mod tests {
         assert_eq!(f.slot, 0);
         assert_eq!(f.kind, StorageFieldKind::Item);
         assert_eq!(f.value_type, "U256");
-        assert_eq!(f.key_type, None);
+        assert_eq!(f.key_types, Vec::<String>::new());
     }
 
     #[test]
@@ -205,7 +222,7 @@ mod tests {
         assert_eq!(f.name, "balances");
         assert_eq!(f.slot, 0);
         assert_eq!(f.kind, StorageFieldKind::Map);
-        assert_eq!(f.key_type, Some("Address".to_string()));
+        assert_eq!(f.key_types, vec!["Address".to_string()]);
         assert_eq!(f.value_type, "U256");
     }
 
@@ -231,7 +248,7 @@ mod tests {
         assert_eq!(layout.fields[4].name, "balances");
         assert_eq!(layout.fields[4].slot, 4);
         assert_eq!(layout.fields[4].kind, StorageFieldKind::Map);
-        assert_eq!(layout.fields[4].key_type, Some("Address".to_string()));
+        assert_eq!(layout.fields[4].key_types, vec!["Address".to_string()]);
         assert_eq!(layout.fields[4].value_type, "U256");
 
         assert_eq!(layout.fields[5].name, "total_supply");
@@ -241,7 +258,7 @@ mod tests {
         assert_eq!(layout.fields[6].name, "allowances");
         assert_eq!(layout.fields[6].slot, 6);
         assert_eq!(layout.fields[6].kind, StorageFieldKind::Map);
-        assert_eq!(layout.fields[6].key_type, Some("String".to_string()));
+        assert_eq!(layout.fields[6].key_types, vec!["String".to_string()]);
     }
 
     #[test]
@@ -273,5 +290,22 @@ mod tests {
         assert_eq!(f.slot, 1);
         assert_eq!(f.value_type, "Address");
         assert!(layout.get_field("missing").is_none());
+    }
+
+    #[test]
+    fn storage_double_map_kind_and_types() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            pub struct Allowances {
+                pub allowances: StorageDoubleMap<Address, Address, U256>,
+            }
+        };
+        let layout = StorageLayout::from_struct(&item).unwrap();
+        assert_eq!(layout.fields.len(), 1);
+        let f = &layout.fields[0];
+        assert_eq!(f.name, "allowances");
+        assert_eq!(f.slot, 0);
+        assert_eq!(f.kind, StorageFieldKind::DoubleMap);
+        assert_eq!(f.key_types, vec!["Address".to_string(), "Address".to_string()]);
+        assert_eq!(f.value_type, "U256");
     }
 }

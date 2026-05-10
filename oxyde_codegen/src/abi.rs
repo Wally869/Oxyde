@@ -114,6 +114,48 @@ impl FunctionAbi {
     }
 }
 
+/// Map a Solidity ABI type string to the Rust wrapper type used in generated code.
+/// All uint/int variants are mapped to `oxyde_sdk::U256` for simplicity.
+pub fn sol_type_to_rust_wrapper_type(sol_type: &str) -> &'static str {
+    if sol_type == "address" {
+        "oxyde_sdk::Address"
+    } else if sol_type == "bool" {
+        "bool"
+    } else {
+        // uint8..uint256, int8..int256 — all become U256
+        "oxyde_sdk::U256"
+    }
+}
+
+/// Generate the expression that encodes a value of the given Solidity type into 32 bytes.
+/// `var` is the variable name holding the value.
+pub fn sol_type_encode_expr(sol_type: &str, var: &str) -> String {
+    if sol_type == "address" {
+        format!(
+            "{{ let mut __buf = [0u8; 32]; __buf[12..32].copy_from_slice({var}.as_slice()); __buf }}"
+        )
+    } else if sol_type == "bool" {
+        format!("{{ let mut __buf = [0u8; 32]; __buf[31] = {var} as u8; __buf }}")
+    } else {
+        // uint / int variants
+        format!("{var}.to_be_bytes::<32>()")
+    }
+}
+
+/// Generate the expression that decodes a 32-byte ABI word at `data[offset..offset+32]`
+/// into the Rust wrapper type for `sol_type`.
+pub fn sol_type_decode_expr(sol_type: &str, data_var: &str, offset_var: &str) -> String {
+    if sol_type == "address" {
+        format!(
+            "oxyde_sdk::Address::from_slice(&{data_var}[{offset_var}+12..{offset_var}+32])"
+        )
+    } else if sol_type == "bool" {
+        format!("{data_var}[{offset_var}+31] != 0")
+    } else {
+        format!("oxyde_sdk::U256::from_be_slice(&{data_var}[{offset_var}..{offset_var}+32])")
+    }
+}
+
 pub fn generate_abi_json(functions: &[FunctionAbi], constructor: Option<&FunctionAbi>) -> String {
     let mut entries: Vec<AbiEntry> = Vec::new();
     if let Some(ctor) = constructor {

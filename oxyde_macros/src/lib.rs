@@ -1,6 +1,30 @@
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{parse_macro_input, FnArg, ImplItem, ItemImpl, ItemStruct, Type};
+
+/// Load a compiled contract's artifacts (bytecode, ABI, typed wrapper) from
+/// build script output. Expands to a module containing the generated code
+/// and re-exports all symbols.
+///
+/// ```ignore
+/// oxyde_sdk::load_contract!(ERC20);
+///
+/// let token = ERC20::deploy(&mut env, ...)?;
+/// ```
+#[proc_macro]
+pub fn load_contract(input: TokenStream) -> TokenStream {
+    let ident = parse_macro_input!(input as syn::Ident);
+    let name = ident.to_string();
+    let mod_name = format_ident!("__{}_artifacts", name.to_lowercase());
+    let file_path = format!("/{}.rs", name);
+
+    TokenStream::from(quote! {
+        mod #mod_name {
+            include!(concat!(env!("OUT_DIR"), #file_path));
+        }
+        use #mod_name::*;
+    })
+}
 
 /// Marks a struct as an Oxyde contract. Validates that all fields are
 /// `StorageItem<T>` or `StorageMap<K, V>`.
@@ -18,7 +42,7 @@ pub fn contract(_attr: TokenStream, input: TokenStream) -> TokenStream {
 
             if !is_storage_type(&field.ty) {
                 let msg = format!(
-                    "field '{}': all contract fields must be StorageItem<T> or StorageMap<K, V>",
+                    "field '{}': all contract fields must be StorageItem<T>, StorageMap<K, V>, or StorageDoubleMap<K1, K2, V>",
                     field_name
                 );
                 return syn::Error::new_spanned(&field.ty, msg)
@@ -42,10 +66,17 @@ fn is_storage_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty {
         if let Some(segment) = type_path.path.segments.last() {
             let name = segment.ident.to_string();
-            return name == "StorageItem" || name == "StorageMap";
+            return name == "StorageItem" || name == "StorageMap" || name == "StorageDoubleMap";
         }
     }
     false
+}
+
+/// Marks a contract struct as extending a parent contract. The attribute is a
+/// passthrough marker consumed by the build-script codegen, not by the Rust compiler.
+#[proc_macro_attribute]
+pub fn extends(_attr: TokenStream, input: TokenStream) -> TokenStream {
+    input
 }
 
 /// Marks an impl block as containing contract entrypoints. Validates method signatures.
