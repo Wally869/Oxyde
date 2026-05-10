@@ -75,8 +75,73 @@ pub fn compile_contract_with_deps(
         contract_struct.attrs.retain(|a| !is_extends_attr(a));
     }
 
-    let compiled = compiler::compile(&contract_struct, &contract_impl)?;
+    // Build external ABIs from all sibling contracts
+    let external_abis = build_external_abis(available_sources, &struct_name)?;
+
+    let compiled = compiler::compile_with_externals(&contract_struct, &contract_impl, &external_abis)?;
     Ok(artifact::ContractArtifact::from_compiled(compiled))
+}
+
+fn build_external_abis(
+    sources: &HashMap<String, String>,
+    exclude_name: &str,
+) -> Result<HashMap<String, compiler::ExternalContractAbi>, String> {
+    let mut abis = HashMap::new();
+    for source in sources.values() {
+        if let Ok(file) = syn::parse_file(source) {
+            if let Ok(s) = find_struct(&file) {
+                let name = s.ident.to_string();
+                if name == exclude_name {
+                    continue;
+                }
+                if let Ok(imp) = find_impl(&file, &name) {
+                    // Resolve inheritance so child contracts expose parent methods
+                    let mut merged_struct = s.clone();
+                    let mut merged_impl = imp.clone();
+                    if let Some(parent_name) = extract_extends_attr(&merged_struct) {
+                        if let Ok(parent_source) = resolve_parent(&parent_name, sources) {
+                            if let Ok(parent_file) = syn::parse_file(&parent_source) {
+                                if let Ok(parent_struct) = find_struct(&parent_file) {
+                                    if let Ok(parent_impl) = find_impl(&parent_file, &parent_struct.ident.to_string()) {
+                                        let _ = merge_parent(&mut merged_struct, &mut merged_impl, &parent_struct, &parent_impl);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut functions = Vec::new();
+                    for item in &merged_impl.items {
+                        if let syn::ImplItem::Fn(method) = item {
+                            if !matches!(method.vis, syn::Visibility::Public(_)) {
+                                continue;
+                            }
+                            let method_name = method.sig.ident.to_string();
+                            if method_name == "constructor" {
+                                continue;
+                            }
+                            let method_args = compiler::extract_typed_args(method);
+                            let output_type = match &method.sig.output {
+                                syn::ReturnType::Default => None,
+                                syn::ReturnType::Type(_, ty) => Some(abi::syn_type_to_string(ty)),
+                            };
+                            let mutability = compiler::infer_mutability(method);
+                            if let Ok(fabi) = abi::FunctionAbi::new(
+                                &method_name,
+                                &method_args,
+                                output_type.as_deref(),
+                                mutability,
+                            ) {
+                                functions.push(fabi);
+                            }
+                        }
+                    }
+                    abis.insert(name, compiler::ExternalContractAbi { functions });
+                }
+            }
+        }
+    }
+    Ok(abis)
 }
 
 // ---- Helpers ----

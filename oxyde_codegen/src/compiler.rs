@@ -3,6 +3,7 @@ use crate::bytecode::BytecodeBuilder;
 use crate::layout::{StorageFieldKind, StorageLayout};
 use crate::opcodes::Opcode;
 use oxyde_parser::typing::{Arg, Mutability};
+use std::collections::HashMap;
 use syn::{Expr, ImplItem, ImplItemFn, ItemImpl, ItemStruct, Stmt};
 
 pub struct CompiledContract {
@@ -14,9 +15,31 @@ pub struct CompiledContract {
     pub layout: StorageLayout,
 }
 
+/// ABI info for an external contract, used to resolve cross-contract calls.
+#[derive(Debug)]
+pub struct ExternalContractAbi {
+    pub functions: Vec<FunctionAbi>,
+}
+
+impl ExternalContractAbi {
+    pub fn find_function(&self, name: &str) -> Option<&FunctionAbi> {
+        self.functions.iter().find(|f| f.name == name)
+    }
+}
+
+type ExternalAbis = HashMap<String, ExternalContractAbi>;
+
 pub fn compile(
     contract_struct: &ItemStruct,
     contract_impl: &ItemImpl,
+) -> Result<CompiledContract, String> {
+    compile_with_externals(contract_struct, contract_impl, &HashMap::new())
+}
+
+pub fn compile_with_externals(
+    contract_struct: &ItemStruct,
+    contract_impl: &ItemImpl,
+    external_abis: &ExternalAbis,
 ) -> Result<CompiledContract, String> {
     let name = contract_struct.ident.to_string();
     let layout = StorageLayout::from_struct(contract_struct)?;
@@ -106,7 +129,7 @@ pub fn compile(
     for (i, method) in regular_methods.iter().enumerate() {
         runtime.place_label(func_labels[i]);
         runtime.emit(Opcode::Pop); // remove the selector copy
-        compile_function(&mut runtime, method, &layout)?;
+        compile_function(&mut runtime, method, &layout, external_abis)?;
     }
 
     let runtime_bytecode = runtime.finalize();
@@ -131,7 +154,7 @@ pub fn compile(
 
 // ---- Helper: extract non-receiver args from a method ----
 
-fn extract_typed_args(method: &ImplItemFn) -> Vec<Arg> {
+pub fn extract_typed_args(method: &ImplItemFn) -> Vec<Arg> {
     method
         .sig
         .inputs
@@ -156,7 +179,7 @@ fn extract_typed_args(method: &ImplItemFn) -> Vec<Arg> {
 
 // ---- Helper: infer mutability from receiver ----
 
-fn infer_mutability(method: &ImplItemFn) -> Mutability {
+pub fn infer_mutability(method: &ImplItemFn) -> Mutability {
     for input in &method.sig.inputs {
         if let syn::FnArg::Receiver(r) = input {
             return if r.mutability.is_some() {
@@ -175,6 +198,7 @@ fn compile_function(
     b: &mut BytecodeBuilder,
     method: &ImplItemFn,
     layout: &StorageLayout,
+    externals: &ExternalAbis,
 ) -> Result<(), String> {
     let args = extract_typed_args(method);
     let stmts = &method.block.stmts;
@@ -194,7 +218,7 @@ fn compile_function(
                 };
 
                 if let Some(init) = &local.init {
-                    compile_expr(b, &init.expr, layout, &args, &mut locals)?;
+                    compile_expr(b, &init.expr, layout, &args, &mut locals, externals)?;
                 } else {
                     return Err("let binding without initializer not supported".to_string());
                 }
@@ -203,7 +227,7 @@ fn compile_function(
                 locals.push(name);
             }
             Stmt::Expr(expr, semi) => {
-                compile_expr(b, expr, layout, &args, &mut locals)?;
+                compile_expr(b, expr, layout, &args, &mut locals, externals)?;
 
                 if is_last && semi.is_none() && has_return {
                     // Last expression without semicolon is the return value.
@@ -256,6 +280,7 @@ fn compile_expr(
     layout: &StorageLayout,
     args: &[Arg],
     locals: &mut Vec<String>,
+    externals: &ExternalAbis,
 ) -> Result<(), String> {
     match expr {
         Expr::MethodCall(mc) => {
@@ -273,7 +298,7 @@ fn compile_expr(
                             .args
                             .first()
                             .ok_or_else(|| "set() requires one argument".to_string())?;
-                        compile_expr(b, val_expr, layout, args, locals)?;
+                        compile_expr(b, val_expr, layout, args, locals, externals)?;
                         b.emit_push_usize(field.slot as usize);
                         b.emit(Opcode::SStore);
                     }
@@ -284,7 +309,7 @@ fn compile_expr(
                             .first()
                             .ok_or_else(|| "get() requires one argument".to_string())?;
                         let slot = field.slot as usize;
-                        emit_keccak_map_slot(b, layout, args, locals, key_expr, slot)?;
+                        emit_keccak_map_slot(b, layout, args, locals, key_expr, slot, externals)?;
                         b.emit(Opcode::SLoad);
                     }
                     (StorageFieldKind::Map, "set_value") => {
@@ -301,12 +326,12 @@ fn compile_expr(
                         let slot = field.slot as usize;
 
                         // Compile value first
-                        compile_expr(b, val_expr, layout, args, locals)?;
+                        compile_expr(b, val_expr, layout, args, locals, externals)?;
                         // Now compute the keccak slot hash on top of val
                         // Temporarily account for val on stack: we push key, mstore, push slot, mstore, sha3
                         // The val sits below; key computation is self-contained (no net stack change
                         // except producing the slot hash on top).
-                        emit_keccak_map_slot_with_offset(b, layout, args, locals, key_expr, slot, 1)?;
+                        emit_keccak_map_slot_with_offset(b, layout, args, locals, key_expr, slot, 1, externals)?;
                         // Stack: [val, slot_hash]
                         b.emit(Opcode::SStore);
                     }
@@ -322,7 +347,7 @@ fn compile_expr(
 
                         // Step 1: keccak256(k1 ++ base_slot)
                         // compile k1 — no extra stack items at this point
-                        compile_expr(b, k1_expr, layout, args, locals)?;
+                        compile_expr(b, k1_expr, layout, args, locals, externals)?;
                         // mem[0..32] = k1
                         b.emit_push_u8(0x00);
                         b.emit(Opcode::MStore);
@@ -340,7 +365,7 @@ fn compile_expr(
                         b.emit_push_u8(0x20);
                         b.emit(Opcode::MStore); // stack: []
                         // compile k2 — no extra stack items
-                        compile_expr(b, k2_expr, layout, args, locals)?;
+                        compile_expr(b, k2_expr, layout, args, locals, externals)?;
                         // mem[0..32] = k2
                         b.emit_push_u8(0x00);
                         b.emit(Opcode::MStore);
@@ -362,12 +387,12 @@ fn compile_expr(
                         let base_slot = field.slot as usize;
 
                         // compile val first — it sits at bottom during slot computation
-                        compile_expr(b, val_expr, layout, args, locals)?;
+                        compile_expr(b, val_expr, layout, args, locals, externals)?;
                         // stack: [val]
 
                         // Step 1: keccak256(k1 ++ base_slot)
                         // 1 extra item (val) on stack — use dummy so DUP depths for locals are correct
-                        emit_compile_expr_with_offset(b, k1_expr, layout, args, locals, 1)?;
+                        emit_compile_expr_with_offset(b, k1_expr, layout, args, locals, 1, externals)?;
                         // stack: [val, k1]
                         b.emit_push_u8(0x00);
                         b.emit(Opcode::MStore); // stack: [val]
@@ -383,7 +408,7 @@ fn compile_expr(
                         b.emit(Opcode::MStore); // stack: [val]
 
                         // compile k2 — 1 extra item (val) on stack
-                        emit_compile_expr_with_offset(b, k2_expr, layout, args, locals, 1)?;
+                        emit_compile_expr_with_offset(b, k2_expr, layout, args, locals, 1, externals)?;
                         // stack: [val, k2]
                         b.emit_push_u8(0x00);
                         b.emit(Opcode::MStore); // stack: [val]
@@ -401,8 +426,8 @@ fn compile_expr(
         }
 
         Expr::Binary(bin) => {
-            compile_expr(b, &bin.left, layout, args, locals)?;
-            compile_expr(b, &bin.right, layout, args, locals)?;
+            compile_expr(b, &bin.left, layout, args, locals, externals)?;
+            compile_expr(b, &bin.right, layout, args, locals, externals)?;
             match bin.op {
                 syn::BinOp::Add(_) => b.emit(Opcode::Add),
                 syn::BinOp::Sub(_) => {
@@ -455,7 +480,7 @@ fn compile_expr(
         Expr::Unary(unary) => {
             match unary.op {
                 syn::UnOp::Not(_) => {
-                    compile_expr(b, &unary.expr, layout, args, locals)?;
+                    compile_expr(b, &unary.expr, layout, args, locals, externals)?;
                     b.emit(Opcode::IsZero);
                 }
                 _ => return Err("unsupported unary operator".to_string()),
@@ -465,12 +490,37 @@ fn compile_expr(
         Expr::Call(call) => {
             if is_u256_from(call) {
                 if let Some(inner) = call.args.first() {
-                    compile_expr(b, inner, layout, args, locals)?;
+                    compile_expr(b, inner, layout, args, locals, externals)?;
                 } else {
                     return Err("U256::from() requires one argument".to_string());
                 }
             } else if is_msg_sender(call) {
                 b.emit(Opcode::Caller);
+            } else if is_self_address(call) {
+                b.emit(Opcode::Address);
+            } else if is_msg_value(call) {
+                b.emit(Opcode::CallValue);
+            } else if let Some((contract_name, method_name)) = is_typed_external_call(call) {
+                if let Some(contract_abi) = externals.get(&contract_name) {
+                    let func = contract_abi
+                        .find_function(&method_name)
+                        .ok_or_else(|| format!("{contract_name} has no method '{method_name}'"))?;
+                    let method_arg_count = call.args.len() - 1; // minus the target
+                    if method_arg_count != func.inputs.len() {
+                        return Err(format!(
+                            "{contract_name}::{method_name}() expects {} args + target, got {} total",
+                            func.inputs.len(),
+                            call.args.len()
+                        ));
+                    }
+                    compile_typed_external_call(b, call, func, layout, args, locals, externals)?;
+                } else {
+                    return Err(format!("unknown contract type: {contract_name}"));
+                }
+            } else if let Some((method_name, arg_count)) = is_external_call(call) {
+                compile_external_call(b, call, &method_name, arg_count, layout, args, locals, externals)?;
+            } else if let Some(n) = is_emit_log_raw(call) {
+                compile_emit_log(b, call, n, layout, args, locals, externals)?;
             } else {
                 return Err("unsupported function call".to_string());
             }
@@ -514,29 +564,29 @@ fn compile_expr(
         }
 
         Expr::Paren(paren) => {
-            compile_expr(b, &paren.expr, layout, args, locals)?;
+            compile_expr(b, &paren.expr, layout, args, locals, externals)?;
         }
 
         Expr::Reference(ref_expr) => {
             // &expr → just compile the inner expression
-            compile_expr(b, &ref_expr.expr, layout, args, locals)?;
+            compile_expr(b, &ref_expr.expr, layout, args, locals, externals)?;
         }
 
         Expr::If(if_expr) => {
             // if cond { body } [else { else_body }]
-            compile_expr(b, &if_expr.cond, layout, args, locals)?;
+            compile_expr(b, &if_expr.cond, layout, args, locals, externals)?;
             b.emit(Opcode::IsZero); // ISZERO: skip body if cond is false
             let skip_label = b.create_label();
             b.emit_jumpi(skip_label);
 
             // Compile the then-block
-            compile_block_stmts(b, &if_expr.then_branch.stmts, layout, args, locals)?;
+            compile_block_stmts(b, &if_expr.then_branch.stmts, layout, args, locals, externals)?;
 
             if let Some((_else_tok, else_expr)) = &if_expr.else_branch {
                 let end_label = b.create_label();
                 b.emit_jump(end_label);
                 b.place_label(skip_label);
-                compile_expr(b, else_expr, layout, args, locals)?;
+                compile_expr(b, else_expr, layout, args, locals, externals)?;
                 b.place_label(end_label);
             } else {
                 b.place_label(skip_label);
@@ -544,7 +594,7 @@ fn compile_expr(
         }
 
         Expr::Block(block_expr) => {
-            compile_block_stmts(b, &block_expr.block.stmts, layout, args, locals)?;
+            compile_block_stmts(b, &block_expr.block.stmts, layout, args, locals, externals)?;
         }
 
         Expr::Macro(mac) => {
@@ -572,11 +622,12 @@ fn compile_block_stmts(
     layout: &StorageLayout,
     args: &[Arg],
     locals: &mut Vec<String>,
+    externals: &ExternalAbis,
 ) -> Result<(), String> {
     for stmt in stmts {
         match stmt {
             Stmt::Expr(expr, _semi) => {
-                compile_expr(b, expr, layout, args, locals)?;
+                compile_expr(b, expr, layout, args, locals, externals)?;
             }
             Stmt::Local(local) => {
                 let name = if let syn::Pat::Ident(pat_ident) = &local.pat {
@@ -585,7 +636,7 @@ fn compile_block_stmts(
                     return Err("unsupported let pattern in block".to_string());
                 };
                 if let Some(init) = &local.init {
-                    compile_expr(b, &init.expr, layout, args, locals)?;
+                    compile_expr(b, &init.expr, layout, args, locals, externals)?;
                 } else {
                     return Err("let binding without initializer not supported".to_string());
                 }
@@ -623,11 +674,12 @@ fn emit_compile_expr_with_offset(
     args: &[Arg],
     locals: &mut Vec<String>,
     extra_stack: usize,
+    externals: &ExternalAbis,
 ) -> Result<(), String> {
     for _ in 0..extra_stack {
         locals.push(String::from("\x00dummy"));
     }
-    compile_expr(b, expr, layout, args, locals)?;
+    compile_expr(b, expr, layout, args, locals, externals)?;
     for _ in 0..extra_stack {
         locals.pop();
     }
@@ -648,8 +700,9 @@ fn emit_keccak_map_slot(
     locals: &mut Vec<String>,
     key_expr: &Expr,
     base_slot: usize,
+    externals: &ExternalAbis,
 ) -> Result<(), String> {
-    emit_keccak_map_slot_with_offset(b, layout, args, locals, key_expr, base_slot, 0)
+    emit_keccak_map_slot_with_offset(b, layout, args, locals, key_expr, base_slot, 0, externals)
 }
 
 /// Same as `emit_keccak_map_slot` but with `extra_stack` items already on the stack
@@ -662,6 +715,7 @@ fn emit_keccak_map_slot_with_offset(
     key_expr: &Expr,
     base_slot: usize,
     extra_stack: usize,
+    externals: &ExternalAbis,
 ) -> Result<(), String> {
     // We need to temporarily inflate `locals` to account for extra_stack items
     // so DUP depth calculation for any locals referenced in key_expr is correct.
@@ -671,7 +725,7 @@ fn emit_keccak_map_slot_with_offset(
         locals.push(String::from("\x00dummy"));
     }
 
-    compile_expr(b, key_expr, layout, args, locals)?;
+    compile_expr(b, key_expr, layout, args, locals, externals)?;
 
     // Remove dummy entries
     for _ in 0..dummy_count {
@@ -732,6 +786,295 @@ fn is_msg_sender(call: &syn::ExprCall) -> bool {
         }
     }
     false
+}
+
+/// Returns true if the call is `self_address()`.
+fn is_self_address(call: &syn::ExprCall) -> bool {
+    if let Expr::Path(path) = &*call.func {
+        let segs: Vec<_> = path.path.segments.iter().collect();
+        if segs.len() == 1 {
+            return segs[0].ident == "self_address";
+        }
+    }
+    false
+}
+
+/// Returns true if the call is `msg_value()`.
+fn is_msg_value(call: &syn::ExprCall) -> bool {
+    if let Expr::Path(path) = &*call.func {
+        let segs: Vec<_> = path.path.segments.iter().collect();
+        if segs.len() == 1 {
+            return segs[0].ident == "msg_value";
+        }
+    }
+    false
+}
+
+/// Returns `Some((contract_name, method_name))` if the call looks like `ContractName::method(...)`
+/// and is not a known intrinsic type.
+fn is_typed_external_call(call: &syn::ExprCall) -> Option<(String, String)> {
+    if let Expr::Path(path) = &*call.func {
+        let segs: Vec<_> = path.path.segments.iter().collect();
+        if segs.len() == 2 {
+            let type_name = segs[0].ident.to_string();
+            let method_name = segs[1].ident.to_string();
+            // Don't match known intrinsics
+            if type_name != "U256" && type_name != "ExternalCall" {
+                return Some((type_name, method_name));
+            }
+        }
+    }
+    None
+}
+
+/// Returns `Some((method_name, arg_count))` if the call is `ExternalCall::call_N` or
+/// `ExternalCall::call_void_N` where N is 1..=3.
+fn is_external_call(call: &syn::ExprCall) -> Option<(String, usize)> {
+    if let Expr::Path(path) = &*call.func {
+        let segs: Vec<_> = path.path.segments.iter().collect();
+        if segs.len() == 2 && segs[0].ident == "ExternalCall" {
+            let method = segs[1].ident.to_string();
+            if let Some(n) = method.strip_prefix("call_void_") {
+                if let Ok(count) = n.parse::<usize>() {
+                    return Some((method, count));
+                }
+            } else if let Some(n) = method.strip_prefix("call_") {
+                if let Ok(count) = n.parse::<usize>() {
+                    return Some((method, count));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Returns `Some(n)` if the call is `emit_logN_raw` where N is 1, 2, or 3.
+fn is_emit_log_raw(call: &syn::ExprCall) -> Option<u8> {
+    if let Expr::Path(path) = &*call.func {
+        let segs: Vec<_> = path.path.segments.iter().collect();
+        if segs.len() == 1 {
+            let name = segs[0].ident.to_string();
+            if let Some(rest) = name.strip_prefix("emit_log") {
+                if let Some(n_str) = rest.strip_suffix("_raw") {
+                    if let Ok(n) = n_str.parse::<u8>() {
+                        if (1..=3).contains(&n) {
+                            return Some(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Compile an `emit_logN_raw(topic0, ..., topicN-1, data)` call into EVM LOGN opcode sequence.
+///
+/// Memory layout: data value is stored at mem[0x00..0x20] (scratch space).
+/// Topics are pushed in reverse order (last topic first) to satisfy EVM stack ordering.
+fn compile_emit_log(
+    b: &mut BytecodeBuilder,
+    call: &syn::ExprCall,
+    num_topics: u8,
+    layout: &StorageLayout,
+    args: &[Arg],
+    locals: &mut Vec<String>,
+    externals: &ExternalAbis,
+) -> Result<(), String> {
+    let expected_args = num_topics as usize + 1;
+    if call.args.len() != expected_args {
+        return Err(format!(
+            "emit_log{num_topics}_raw expects {expected_args} arguments, got {}",
+            call.args.len()
+        ));
+    }
+
+    // Last arg is the non-indexed data value; store it in mem[0x00..0x20]
+    let data_expr = &call.args[call.args.len() - 1];
+    compile_expr(b, data_expr, layout, args, locals, externals)?;
+    b.emit_push_u8(0x00);
+    b.emit(Opcode::MStore);
+
+    // Push topics in reverse order so that after LOG pops (offset, size, topic0, topic1, ...)
+    // with offset at TOS, we need: TOS=offset, next=size, then topics in ascending order.
+    // We push: topicN-1, ..., topic1, topic0, size=0x20, offset=0x00
+    for i in (0..num_topics as usize).rev() {
+        compile_expr(b, &call.args[i], layout, args, locals, externals)?;
+    }
+
+    b.emit_push_u8(0x20); // size = 32 bytes
+    b.emit_push_u8(0x00); // offset = 0
+
+    match num_topics {
+        1 => b.emit(Opcode::Log1),
+        2 => b.emit(Opcode::Log2),
+        3 => b.emit(Opcode::Log3),
+        _ => return Err(format!("unsupported log topic count: {num_topics}")),
+    }
+
+    Ok(())
+}
+
+/// Compile an `ExternalCall::call_N` or `ExternalCall::call_void_N` into EVM CALL sequence.
+///
+/// Call args: `[target: Address, selector: u32, arg0: U256, arg1: U256, ...]`
+/// Memory layout used:
+///   mem[0x80..0xA0]           = selector << 224 (4 bytes left-aligned in 32-byte word)
+///   mem[0x84 + i*32 .. +32]  = argI             (MSTORE at 0x84 + i*32)
+/// Return data (if any) is placed at mem[0x00..0x20] and loaded onto the stack.
+fn compile_external_call(
+    b: &mut BytecodeBuilder,
+    call: &syn::ExprCall,
+    method_name: &str,
+    arg_count: usize,
+    layout: &StorageLayout,
+    args: &[Arg],
+    locals: &mut Vec<String>,
+    externals: &ExternalAbis,
+) -> Result<(), String> {
+    let is_void = method_name.starts_with("call_void_");
+    let has_return = !is_void;
+    let expected_args = 2 + arg_count;
+
+    if call.args.len() != expected_args {
+        return Err(format!(
+            "ExternalCall::{method_name} expects {expected_args} arguments, got {}",
+            call.args.len()
+        ));
+    }
+
+    let target_expr = &call.args[0];
+    let selector_expr = &call.args[1];
+
+    // 1. Write selector to mem[0x80..0xA0]: selector << 224 so the 4 bytes sit at 0x80..0x84.
+    compile_expr(b, selector_expr, layout, args, locals, externals)?;
+    b.emit_push_u8(0xE0); // 224
+    b.emit(Opcode::LeftShift);
+    b.emit_push_u8(0x80);
+    b.emit(Opcode::MStore);
+
+    // 2. Write each arg to mem[0x84 + i*32].
+    for i in 0..arg_count {
+        let arg_expr = &call.args[2 + i];
+        compile_expr(b, arg_expr, layout, args, locals, externals)?;
+        let offset: usize = 0x84 + i * 32;
+        b.emit_push_usize(offset);
+        b.emit(Opcode::MStore);
+    }
+
+    let calldata_size: usize = 4 + arg_count * 32;
+    let ret_size: usize = if has_return { 32 } else { 0 };
+
+    // 3. Push CALL arguments (EVM pops: gas, addr, value, argsOffset, argsSize, retOffset, retSize)
+    //    so we push in reverse order.
+    b.emit_push_usize(ret_size);      // retSize
+    b.emit_push_u8(0x00);             // retOffset
+    b.emit_push_usize(calldata_size); // argsSize
+    b.emit_push_u8(0x80);             // argsOffset
+    b.emit(Opcode::Push0);            // value = 0
+    // 5 extra items on stack above locals — adjust DUP depth for target_expr
+    emit_compile_expr_with_offset(b, target_expr, layout, args, locals, 5, externals)?;
+    b.emit(Opcode::Gas);              // gas = all remaining gas
+    b.emit(Opcode::Call);             // → pushes 1 (success) or 0 (failure)
+
+    // 4. Check success; revert with returndata on failure.
+    let success_label = b.create_label();
+    b.emit_jumpi(success_label); // jump if success != 0
+    // Failure path: bubble up returndata.
+    b.emit(Opcode::ReturnDataSize);
+    b.emit(Opcode::Push0);
+    b.emit(Opcode::Push0);
+    b.emit(Opcode::ReturnDataCopy);
+    b.emit(Opcode::ReturnDataSize);
+    b.emit(Opcode::Push0);
+    b.emit(Opcode::Revert);
+
+    b.place_label(success_label);
+
+    // 5. If the call has a return value, load it from mem[0x00].
+    if has_return {
+        b.emit_push_u8(0x00);
+        b.emit(Opcode::MLoad);
+    }
+
+    Ok(())
+}
+
+/// Compile a typed cross-contract call `ContractName::method(target, arg0, arg1, ...)` using
+/// a looked-up selector from the external ABI.
+fn compile_typed_external_call(
+    b: &mut BytecodeBuilder,
+    call: &syn::ExprCall,
+    func_abi: &FunctionAbi,
+    layout: &StorageLayout,
+    args: &[Arg],
+    locals: &mut Vec<String>,
+    externals: &ExternalAbis,
+) -> Result<(), String> {
+    let has_return = !func_abi.outputs.is_empty();
+    let arg_count = func_abi.inputs.len();
+
+    // call.args[0] = target address, call.args[1..] = method args
+    if call.args.len() != arg_count + 1 {
+        return Err(format!(
+            "{}() expects {} args + target, got {}",
+            func_abi.name,
+            arg_count,
+            call.args.len()
+        ));
+    }
+
+    let target_expr = &call.args[0];
+    let selector_u32 = u32::from_be_bytes(func_abi.selector);
+
+    // Write selector to mem[0x80]: selector << 224
+    b.emit_push_u32(selector_u32);
+    b.emit_push_u8(0xE0);
+    b.emit(Opcode::LeftShift);
+    b.emit_push_u8(0x80);
+    b.emit(Opcode::MStore);
+
+    // Write each method arg to mem[0x84 + i*32]
+    for i in 0..arg_count {
+        let arg_expr = &call.args[1 + i]; // skip target
+        compile_expr(b, arg_expr, layout, args, locals, externals)?;
+        let offset = 0x84 + i * 32;
+        b.emit_push_usize(offset);
+        b.emit(Opcode::MStore);
+    }
+
+    let calldata_size = 4 + arg_count * 32;
+    let ret_size: usize = if has_return { 32 } else { 0 };
+
+    // Push CALL args (EVM pops: gas, addr, value, argsOffset, argsSize, retOffset, retSize)
+    b.emit_push_usize(ret_size);      // retSize
+    b.emit_push_u8(0x00);             // retOffset
+    b.emit_push_usize(calldata_size); // argsSize
+    b.emit_push_u8(0x80);             // argsOffset
+    b.emit(Opcode::Push0);            // value = 0
+    // 5 extra items on stack above locals — adjust DUP depth for target_expr
+    emit_compile_expr_with_offset(b, target_expr, layout, args, locals, 5, externals)?;
+    b.emit(Opcode::Gas);
+    b.emit(Opcode::Call);
+
+    // Check success; revert with returndata on failure
+    let success_label = b.create_label();
+    b.emit_jumpi(success_label);
+    b.emit(Opcode::ReturnDataSize);
+    b.emit(Opcode::Push0);
+    b.emit(Opcode::Push0);
+    b.emit(Opcode::ReturnDataCopy);
+    b.emit(Opcode::ReturnDataSize);
+    b.emit(Opcode::Push0);
+    b.emit(Opcode::Revert);
+    b.place_label(success_label);
+
+    if has_return {
+        b.emit_push_u8(0x00);
+        b.emit(Opcode::MLoad);
+    }
+
+    Ok(())
 }
 
 // ---- Creation code builder ----
@@ -931,6 +1274,71 @@ mod tests {
     }
 
     #[test]
+    fn compile_self_address_and_msg_value() {
+        let contract_struct: syn::ItemStruct = syn::parse_quote! {
+            pub struct Env {
+                pub dummy: StorageItem<U256>,
+            }
+        };
+        let contract_impl: syn::ItemImpl = syn::parse_quote! {
+            impl Env {
+                pub fn get_self(&self) -> Address {
+                    self_address()
+                }
+                pub fn get_value(&self) -> U256 {
+                    msg_value()
+                }
+            }
+        };
+        let result = compile(&contract_struct, &contract_impl);
+        assert!(result.is_ok(), "compilation failed: {:?}", result.err());
+        let compiled = result.unwrap();
+        assert_eq!(compiled.functions.len(), 2);
+        // Verify ADDRESS opcode (0x30) and CALLVALUE opcode (0x34) appear in bytecode.
+        assert!(
+            compiled.runtime_bytecode.contains(&0x30),
+            "ADDRESS opcode not found"
+        );
+        assert!(
+            compiled.runtime_bytecode.contains(&0x34),
+            "CALLVALUE opcode not found"
+        );
+    }
+
+    #[test]
+    fn compile_external_call_intrinsic() {
+        let contract_struct: syn::ItemStruct = syn::parse_quote! {
+            pub struct Vault {
+                pub token: StorageItem<U256>,
+            }
+        };
+        let contract_impl: syn::ItemImpl = syn::parse_quote! {
+            impl Vault {
+                pub fn do_transfer(&mut self, target: U256, to: U256, amount: U256) {
+                    ExternalCall::call_void_2(target, 0xa9059cbbu32, to, amount)
+                }
+                pub fn query_balance(&self, target: U256, account: U256) -> U256 {
+                    ExternalCall::call_1(target, 0x70a08231u32, account)
+                }
+            }
+        };
+        let result = compile(&contract_struct, &contract_impl);
+        assert!(result.is_ok(), "compilation failed: {:?}", result.err());
+        let compiled = result.unwrap();
+        assert_eq!(compiled.functions.len(), 2);
+        // CALL opcode is 0xf1
+        assert!(
+            compiled.runtime_bytecode.contains(&0xf1),
+            "CALL opcode not found in bytecode"
+        );
+        // GAS opcode is 0x5a
+        assert!(
+            compiled.runtime_bytecode.contains(&0x5a),
+            "GAS opcode not found in bytecode"
+        );
+    }
+
+    #[test]
     fn compile_erc20_patterns() {
         let contract_struct: syn::ItemStruct = syn::parse_quote! {
             pub struct Erc20 {
@@ -962,5 +1370,51 @@ mod tests {
         let compiled = result.unwrap();
         assert_eq!(compiled.functions.len(), 2);
         assert!(!compiled.runtime_bytecode.is_empty());
+    }
+
+    #[test]
+    fn compile_event_emission() {
+        let contract_struct: syn::ItemStruct = syn::parse_quote! {
+            pub struct Token {
+                pub total_supply: StorageItem<U256>,
+                pub balances: StorageMap<Address, U256>,
+            }
+        };
+        let contract_impl: syn::ItemImpl = syn::parse_quote! {
+            impl Token {
+                pub fn mint(&mut self, to: Address, amount: U256) {
+                    self.balances.set_value(&to, self.balances.get(&to) + amount);
+                    self.total_supply.set(self.total_supply.get_value() + amount);
+                    emit_log1_raw(U256::from(0x1234u32), amount);
+                }
+                pub fn transfer(&mut self, from: Address, to: Address, amount: U256) {
+                    self.balances.set_value(&to, self.balances.get(&to) + amount);
+                    emit_log2_raw(U256::from(0xabcdu32), U256::from(0x5678u32), amount);
+                }
+                pub fn triple_topic(&mut self, a: U256, b: U256, c: U256) {
+                    emit_log3_raw(U256::from(0x01u32), U256::from(0x02u32), U256::from(0x03u32), a);
+                }
+            }
+        };
+        let result = compile(&contract_struct, &contract_impl);
+        assert!(result.is_ok(), "compilation failed: {:?}", result.err());
+
+        let compiled = result.unwrap();
+        assert_eq!(compiled.functions.len(), 3);
+        assert!(!compiled.runtime_bytecode.is_empty());
+
+        // LOG1 = 0xa1, LOG2 = 0xa2, LOG3 = 0xa3
+        assert!(
+            compiled.runtime_bytecode.contains(&0xa1),
+            "LOG1 opcode not found in bytecode"
+        );
+        assert!(
+            compiled.runtime_bytecode.contains(&0xa2),
+            "LOG2 opcode not found in bytecode"
+        );
+        assert!(
+            compiled.runtime_bytecode.contains(&0xa3),
+            "LOG3 opcode not found in bytecode"
+        );
     }
 }
