@@ -1,12 +1,10 @@
 [workspace]
+resolver = "2"
 
 members = [
+    "oxyde_parser",
+    "oxyde_codegen",
     "oxyde_macros",
-    "oxyde_transpiler",
-    "oxyde_cli",
-    "oxyde_test",
     "oxyde_sdk",
     "sample_contracts",
-    "oxyde_evm",
-    "oxyde_parser",
 ]

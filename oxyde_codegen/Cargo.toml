@@ -1,0 +1,16 @@
+[package]
+name = "oxyde_codegen"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+revm = { version = "38", default-features = false, features = ["std"] }
+
+[dependencies]
+oxyde_parser = { path = "../oxyde_parser" }
+syn = { version = "2", features = ["full", "visit"] }
+alloy-primitives = "1"
+alloy-sol-types = "1"
+sha3 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

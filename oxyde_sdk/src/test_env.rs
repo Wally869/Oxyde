@@ -1,164 +1,121 @@
-use std::{sync::Mutex, time::{SystemTime, UNIX_EPOCH}};
+use alloy_primitives::{Address, U256};
+use revm::{
+    ExecuteCommitEvm, MainBuilder, MainContext,
+    context::{Context, TxEnv},
+    database::InMemoryDB,
+    primitives::TxKind,
+    context_interface::result::{ExecutionResult, Output},
+};
 
-use crate::{Address, Constructable, Entrypoint, Mapping, U256, Deref, TEST_STORAGE}; //, DerefEntrypoints};
-use lazy_static::{lazy_static};
-use serde::Serialize;
+use crate::errors::TestEnvError;
 
-lazy_static! {
-    static ref BALANCES: Mapping<Address, U256> = Mapping::new();
-    //static ref CONTRACTS: Mapping<Address, Box<dyn Entrypoint>> = Mapping::new();
+pub struct TestEnv {
+    db: InMemoryDB,
 }
 
-pub static mut CONTRACTS: Mutex<Vec<(Address, Box<dyn Deref>)>> = Mutex::new(vec![]);
-//pub static mut BALANCES: Mutex<Mapping<Address, U256>> = Mutex::new(Mapping::new());
-
-
-pub struct Context {}
-
-impl Context {
-    pub fn execute_contract(
-        contract_address: &Address,
-        method: &str,
-        data: Vec<u8>,
-    ) -> Vec<u8> {
-        let prev_contract = TEST_STORAGE.get_current_contract().unwrap();
-
-        let mut contract = unsafe {
-            let mut lock = CONTRACTS.lock().unwrap();
-            let contract = lock.iter_mut().find(|(addr, _)| addr.eq(&contract_address));
-
-
-            let copy = contract.unwrap().1.deref();
-            //contract.unwrap().1.execute(method, data)
-            copy
-        };
-
-        let data = contract.execute(method, data);
-        TEST_STORAGE.set_current_contract(prev_contract.clone()).unwrap();
-
-        return data;
-    }
-
-    pub fn query_contract(
-        contract_address: &Address,
-        method: &str,
-        data: Vec<u8>,
-    ) -> Vec<u8> {
-        let prev_contract = TEST_STORAGE.get_current_contract().unwrap();
-
-        let contract = unsafe {
-            let mut lock = CONTRACTS.lock().unwrap();
-            // all addresses
-            //let addresses: Vec<Address> = lock.iter().map(|elem| elem.0.clone()).collect();
-
-
-            let contract = lock.iter_mut().find(|(addr, _)| addr.eq(&contract_address));
-            let contract = &mut contract.unwrap().1;
-            TEST_STORAGE.set_current_contract(contract_address.clone()).unwrap();
-
-            contract.load_from_store();
-            contract.deref() //  execute(method, data)
-            //contract.unwrap().1.deref() //.1.query(method, data)
-        };
-
-        let data = contract.query(method, data);
-        TEST_STORAGE.set_current_contract(prev_contract.clone()).unwrap();
-
-        return data;
-    }
-
-    pub fn msg_sender() -> Address {
-        return TEST_STORAGE.get_common_value("msg_sender").unwrap();
-    }
-
-    pub fn timestamp() -> U256 {
-        return TEST_STORAGE.get_common_value("timestamp").unwrap();
-    }
-
-    pub fn emit<T>(event: T) where T: Serialize {
-        bincode::serialize(&event).unwrap();
-    }
-}
-
-
-
-pub struct App {}
-
-impl App {
-    pub fn deploy<T>(&mut self, data: Vec<u8>) -> Address
-    where
-        T: Deref + Entrypoint + Constructable,
-    {
-        let addr = Address::random();
-        TEST_STORAGE.set_current_contract(addr.clone()).unwrap();
-
-        unsafe {
-            let mut lock = CONTRACTS.lock().unwrap();
-            lock.push((addr, T::_constructor(data)));
-        }
-
-        //self.contracts.insert(addr.clone(), T::_constructor(data));
-        return addr;
-    }
-
+impl TestEnv {
     pub fn new() -> Self {
-        // setting some global data that must be explicitly modified?  
-        let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        TEST_STORAGE.set_common_value("timestamp", &U256::from(time)).unwrap();
-
-        return App {};
+        TestEnv {
+            db: InMemoryDB::default(),
+        }
     }
 
-    pub fn execute_contract(
+    /// Deploy a contract. `bytecode` should be creation_bytecode + ABI-encoded constructor args.
+    /// Returns the deployed contract address.
+    pub fn deploy(&mut self, bytecode: &[u8]) -> Result<Address, TestEnvError> {
+        let mut evm = Context::mainnet()
+            .with_db(&mut self.db)
+            .modify_cfg_chained(|cfg| cfg.disable_nonce_check = true)
+            .build_mainnet();
+
+        let tx = TxEnv::builder()
+            .caller(Address::ZERO)
+            .gas_limit(10_000_000)
+            .kind(TxKind::Create)
+            .data(revm::primitives::Bytes::copy_from_slice(bytecode))
+            .value(U256::ZERO)
+            .build()
+            .map_err(|e| TestEnvError::DeployFailed(e.to_string()))?;
+
+        let result = evm
+            .transact_commit(tx)
+            .map_err(|e| TestEnvError::DeployFailed(format!("{e:?}")))?;
+
+        match result {
+            ExecutionResult::Success { output, .. } => match output {
+                Output::Create(_, Some(addr)) => Ok(addr),
+                _ => Err(TestEnvError::NoAddress),
+            },
+            ExecutionResult::Revert { output, .. } => {
+                let hex: String = output.iter().map(|b| format!("{b:02x}")).collect();
+                Err(TestEnvError::Reverted(format!("0x{hex}")))
+            }
+            ExecutionResult::Halt { reason, .. } => {
+                Err(TestEnvError::Halted(format!("{reason:?}")))
+            }
+        }
+    }
+
+    /// Call a contract with the given calldata (selector + ABI-encoded args).
+    /// This is a state-mutating call.
+    pub fn call(
         &mut self,
-        caller: &Address,
-        contract_address: &Address,
-        method: &str,
-        data: Vec<u8>,
-    ) -> Vec<u8> {
-        TEST_STORAGE.set_current_contract(contract_address.clone()).unwrap();
-        TEST_STORAGE.set_common_value("msg_sender", caller).unwrap();
+        caller: Address,
+        contract: Address,
+        calldata: &[u8],
+    ) -> Result<Vec<u8>, TestEnvError> {
+        let mut evm = Context::mainnet()
+            .with_db(&mut self.db)
+            .modify_cfg_chained(|cfg| cfg.disable_nonce_check = true)
+            .build_mainnet();
 
-        let mut contract = unsafe {
-            let mut lock = CONTRACTS.lock().unwrap();
-            
-            let contract = lock.iter_mut().find(|(addr, _)| addr.eq(&contract_address));
-            let contract = &mut contract.unwrap().1;
-            // set active
-            
-            contract.load_from_store();
-            contract.deref() //  execute(method, data)
-        };
+        let tx = TxEnv::builder()
+            .caller(caller)
+            .gas_limit(10_000_000)
+            .kind(TxKind::Call(contract))
+            .data(revm::primitives::Bytes::copy_from_slice(calldata))
+            .value(U256::ZERO)
+            .build()
+            .map_err(|e| TestEnvError::DeployFailed(e.to_string()))?;
 
-        let data = contract.execute(method, data);
+        let result = evm
+            .transact_commit(tx)
+            .map_err(|e| TestEnvError::Halted(format!("{e:?}")))?;
 
-        return data;
+        match result {
+            ExecutionResult::Success { output, .. } => Ok(output.into_data().to_vec()),
+            ExecutionResult::Revert { output, .. } => {
+                let hex: String = output.iter().map(|b| format!("{b:02x}")).collect();
+                Err(TestEnvError::Reverted(format!("0x{hex}")))
+            }
+            ExecutionResult::Halt { reason, .. } => {
+                Err(TestEnvError::Halted(format!("{reason:?}")))
+            }
+        }
     }
 
-    pub fn query_contract(
-        &self,
-        contract_address: &Address,
-        method: &str,
-        data: Vec<u8>,
-    ) -> Vec<u8> {
-        TEST_STORAGE.set_current_contract(contract_address.clone()).unwrap();
+    /// Static call (read-only). Same as call but does not mutate state.
+    /// For view functions.
+    pub fn static_call(
+        &mut self,
+        contract: Address,
+        calldata: &[u8],
+    ) -> Result<Vec<u8>, TestEnvError> {
+        self.call(Address::ZERO, contract, calldata)
+    }
 
-        let contract = unsafe {
-            let mut lock = CONTRACTS.lock().unwrap();
-            let contract = lock.iter_mut().find(|(addr, _)| addr.eq(&contract_address));
+    /// Set the ETH balance of an address (useful for testing payable functions later).
+    pub fn set_balance(&mut self, address: Address, balance: U256) {
+        use revm::state::AccountInfo;
 
-            //yup.unwrap().1.deref() //  execute(method, data)
-            let contract = &mut contract.unwrap().1;
-
-            contract.load_from_store();
-            contract.deref() //  execute(method, data)
-            //yup.unwrap().1.query(method, data)
-        };
-
-        let data = contract.query(method, data);
-
-        return data;
+        let mut info = AccountInfo::default();
+        info.balance = balance;
+        self.db.insert_account_info(address, info);
     }
 }
 
-
+impl Default for TestEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}

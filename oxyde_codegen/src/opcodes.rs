@@ -1,0 +1,320 @@
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum Opcode {
+    Stop,
+    Add,
+    Mul,
+    Sub,
+    Div,
+    SignedDiv,
+    Modulo,
+    SignedModulo,
+    AddModulo,
+    MulModulo,
+    Exp,
+    SignedExtend,
+
+    LessThan,
+    GreaterThan,
+    SignedLessThan,
+    SignedGreaterThan,
+    Eq,
+    IsZero,
+    And,
+    Or,
+    Xor,
+    Not,
+    Byte,
+    LeftShift,
+    LogicalRightShift,
+    ArithmeticRightShift,
+
+    Sha3,
+
+    Address,
+    Balance,
+    Origin,
+    Caller,
+    CallValue,
+    CallDataLoad,
+    CallDataSize,
+    CallDataCopy,
+    CodeSize,
+    CodeCopy,
+    GasPrice,
+    ExtCodeSize,
+    ExtCodeCopy,
+    ReturnDataSize,
+    ReturnDataCopy,
+    ExtCodeHash,
+
+    BlockHash,
+    Coinbase,
+    Timestamp,
+    Number,
+    Difficulty,
+    GasLimit,
+    ChainId,
+    SelfBalance,
+    BaseFee,
+
+    Pop,
+    MLoad,
+    MStore,
+    MStore8,
+    SLoad,
+    SStore,
+    Jump,
+    JumpI,
+    PC,
+    MSize,
+    Gas,
+    JumpDest,
+
+    Push0,
+    Push(u8),
+    Dup(u8),
+    Swap(u8),
+
+    Log0,
+    Log1,
+    Log2,
+    Log3,
+    Log4,
+
+    Create,
+    Call,
+    CallCode,
+    Return,
+    DelegateCall,
+    Create2,
+
+    StaticCall,
+
+    Revert,
+    Invalid,
+    SelfDestruct,
+}
+
+impl Opcode {
+    pub fn to_byte(&self) -> u8 {
+        match self {
+            Opcode::Stop => 0x00,
+            Opcode::Add => 0x01,
+            Opcode::Mul => 0x02,
+            Opcode::Sub => 0x03,
+            Opcode::Div => 0x04,
+            Opcode::SignedDiv => 0x05,
+            Opcode::Modulo => 0x06,
+            Opcode::SignedModulo => 0x07,
+            Opcode::AddModulo => 0x08,
+            Opcode::MulModulo => 0x09,
+            Opcode::Exp => 0x0a,
+            Opcode::SignedExtend => 0x0b,
+            Opcode::LessThan => 0x10,
+            Opcode::GreaterThan => 0x11,
+            Opcode::SignedLessThan => 0x12,
+            Opcode::SignedGreaterThan => 0x13,
+            Opcode::Eq => 0x14,
+            Opcode::IsZero => 0x15,
+            Opcode::And => 0x16,
+            Opcode::Or => 0x17,
+            Opcode::Xor => 0x18,
+            Opcode::Not => 0x19,
+            Opcode::Byte => 0x1a,
+            Opcode::LeftShift => 0x1b,
+            Opcode::LogicalRightShift => 0x1c,
+            Opcode::ArithmeticRightShift => 0x1d,
+            Opcode::Sha3 => 0x20,
+            Opcode::Address => 0x30,
+            Opcode::Balance => 0x31,
+            Opcode::Origin => 0x32,
+            Opcode::Caller => 0x33,
+            Opcode::CallValue => 0x34,
+            Opcode::CallDataLoad => 0x35,
+            Opcode::CallDataSize => 0x36,
+            Opcode::CallDataCopy => 0x37,
+            Opcode::CodeSize => 0x38,
+            Opcode::CodeCopy => 0x39,
+            Opcode::GasPrice => 0x3a,
+            Opcode::ExtCodeSize => 0x3b,
+            Opcode::ExtCodeCopy => 0x3c,
+            Opcode::ReturnDataSize => 0x3d,
+            Opcode::ReturnDataCopy => 0x3e,
+            Opcode::ExtCodeHash => 0x3f,
+            Opcode::BlockHash => 0x40,
+            Opcode::Coinbase => 0x41,
+            Opcode::Timestamp => 0x42,
+            Opcode::Number => 0x43,
+            Opcode::Difficulty => 0x44,
+            Opcode::GasLimit => 0x45,
+            Opcode::ChainId => 0x46,
+            Opcode::SelfBalance => 0x47,
+            Opcode::BaseFee => 0x48,
+            Opcode::Pop => 0x50,
+            Opcode::MLoad => 0x51,
+            Opcode::MStore => 0x52,
+            Opcode::MStore8 => 0x53,
+            Opcode::SLoad => 0x54,
+            Opcode::SStore => 0x55,
+            Opcode::Jump => 0x56,
+            Opcode::JumpI => 0x57,
+            Opcode::PC => 0x58,
+            Opcode::MSize => 0x59,
+            Opcode::Gas => 0x5a,
+            Opcode::JumpDest => 0x5b,
+            Opcode::Push0 => 0x5f,
+            Opcode::Push(n) => 0x5f + n,
+            Opcode::Dup(n) => 0x7f + n,
+            Opcode::Swap(n) => 0x8f + n,
+            Opcode::Log0 => 0xa0,
+            Opcode::Log1 => 0xa1,
+            Opcode::Log2 => 0xa2,
+            Opcode::Log3 => 0xa3,
+            Opcode::Log4 => 0xa4,
+            Opcode::Create => 0xf0,
+            Opcode::Call => 0xf1,
+            Opcode::CallCode => 0xf2,
+            Opcode::Return => 0xf3,
+            Opcode::DelegateCall => 0xf4,
+            Opcode::Create2 => 0xf5,
+            Opcode::StaticCall => 0xfa,
+            Opcode::Revert => 0xfd,
+            Opcode::Invalid => 0xfe,
+            Opcode::SelfDestruct => 0xff,
+        }
+    }
+
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x00 => Some(Opcode::Stop),
+            0x01 => Some(Opcode::Add),
+            0x02 => Some(Opcode::Mul),
+            0x03 => Some(Opcode::Sub),
+            0x04 => Some(Opcode::Div),
+            0x05 => Some(Opcode::SignedDiv),
+            0x06 => Some(Opcode::Modulo),
+            0x07 => Some(Opcode::SignedModulo),
+            0x08 => Some(Opcode::AddModulo),
+            0x09 => Some(Opcode::MulModulo),
+            0x0a => Some(Opcode::Exp),
+            0x0b => Some(Opcode::SignedExtend),
+            0x0c..=0x0f => None,
+            0x10 => Some(Opcode::LessThan),
+            0x11 => Some(Opcode::GreaterThan),
+            0x12 => Some(Opcode::SignedLessThan),
+            0x13 => Some(Opcode::SignedGreaterThan),
+            0x14 => Some(Opcode::Eq),
+            0x15 => Some(Opcode::IsZero),
+            0x16 => Some(Opcode::And),
+            0x17 => Some(Opcode::Or),
+            0x18 => Some(Opcode::Xor),
+            0x19 => Some(Opcode::Not),
+            0x1a => Some(Opcode::Byte),
+            0x1b => Some(Opcode::LeftShift),
+            0x1c => Some(Opcode::LogicalRightShift),
+            0x1d => Some(Opcode::ArithmeticRightShift),
+            0x1e..=0x1f => None,
+            0x20 => Some(Opcode::Sha3),
+            0x21..=0x2f => None,
+            0x30 => Some(Opcode::Address),
+            0x31 => Some(Opcode::Balance),
+            0x32 => Some(Opcode::Origin),
+            0x33 => Some(Opcode::Caller),
+            0x34 => Some(Opcode::CallValue),
+            0x35 => Some(Opcode::CallDataLoad),
+            0x36 => Some(Opcode::CallDataSize),
+            0x37 => Some(Opcode::CallDataCopy),
+            0x38 => Some(Opcode::CodeSize),
+            0x39 => Some(Opcode::CodeCopy),
+            0x3a => Some(Opcode::GasPrice),
+            0x3b => Some(Opcode::ExtCodeSize),
+            0x3c => Some(Opcode::ExtCodeCopy),
+            0x3d => Some(Opcode::ReturnDataSize),
+            0x3e => Some(Opcode::ReturnDataCopy),
+            0x3f => Some(Opcode::ExtCodeHash),
+            0x40 => Some(Opcode::BlockHash),
+            0x41 => Some(Opcode::Coinbase),
+            0x42 => Some(Opcode::Timestamp),
+            0x43 => Some(Opcode::Number),
+            0x44 => Some(Opcode::Difficulty),
+            0x45 => Some(Opcode::GasLimit),
+            0x46 => Some(Opcode::ChainId),
+            0x47 => Some(Opcode::SelfBalance),
+            0x48 => Some(Opcode::BaseFee),
+            0x49..=0x4f => None,
+            0x50 => Some(Opcode::Pop),
+            0x51 => Some(Opcode::MLoad),
+            0x52 => Some(Opcode::MStore),
+            0x53 => Some(Opcode::MStore8),
+            0x54 => Some(Opcode::SLoad),
+            0x55 => Some(Opcode::SStore),
+            0x56 => Some(Opcode::Jump),
+            0x57 => Some(Opcode::JumpI),
+            0x58 => Some(Opcode::PC),
+            0x59 => Some(Opcode::MSize),
+            0x5a => Some(Opcode::Gas),
+            0x5b => Some(Opcode::JumpDest),
+            0x5c..=0x5e => None,
+            0x5f => Some(Opcode::Push0),
+            0x60..=0x7f => Some(Opcode::Push(byte - 0x5f)),
+            0x80..=0x8f => Some(Opcode::Dup(byte - 0x7f)),
+            0x90..=0x9f => Some(Opcode::Swap(byte - 0x8f)),
+            0xa0 => Some(Opcode::Log0),
+            0xa1 => Some(Opcode::Log1),
+            0xa2 => Some(Opcode::Log2),
+            0xa3 => Some(Opcode::Log3),
+            0xa4 => Some(Opcode::Log4),
+            0xa5..=0xef => None,
+            0xf0 => Some(Opcode::Create),
+            0xf1 => Some(Opcode::Call),
+            0xf2 => Some(Opcode::CallCode),
+            0xf3 => Some(Opcode::Return),
+            0xf4 => Some(Opcode::DelegateCall),
+            0xf5 => Some(Opcode::Create2),
+            0xf6..=0xf9 => None,
+            0xfa => Some(Opcode::StaticCall),
+            0xfb..=0xfc => None,
+            0xfd => Some(Opcode::Revert),
+            0xfe => Some(Opcode::Invalid),
+            0xff => Some(Opcode::SelfDestruct),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Opcode;
+
+    #[test]
+    fn dup_roundtrip() {
+        assert_eq!(Opcode::from_byte(0x80), Some(Opcode::Dup(1)));
+        assert_eq!(Opcode::from_byte(0x8f), Some(Opcode::Dup(16)));
+        assert_eq!(Opcode::Dup(1).to_byte(), 0x80);
+        assert_eq!(Opcode::Dup(16).to_byte(), 0x8f);
+    }
+
+    #[test]
+    fn push_roundtrip() {
+        assert_eq!(Opcode::from_byte(0x60), Some(Opcode::Push(1)));
+        assert_eq!(Opcode::from_byte(0x7f), Some(Opcode::Push(32)));
+        assert_eq!(Opcode::Push(1).to_byte(), 0x60);
+        assert_eq!(Opcode::Push(32).to_byte(), 0x7f);
+    }
+
+    #[test]
+    fn swap_roundtrip() {
+        assert_eq!(Opcode::from_byte(0x90), Some(Opcode::Swap(1)));
+        assert_eq!(Opcode::from_byte(0x9f), Some(Opcode::Swap(16)));
+        assert_eq!(Opcode::Swap(1).to_byte(), 0x90);
+        assert_eq!(Opcode::Swap(16).to_byte(), 0x9f);
+    }
+
+    #[test]
+    fn full_roundtrip() {
+        for byte in 0x00..=0xffu8 {
+            if let Some(op) = Opcode::from_byte(byte) {
+                assert_eq!(op.to_byte(), byte, "roundtrip failed for {op:?}");
+            }
+        }
+    }
+}

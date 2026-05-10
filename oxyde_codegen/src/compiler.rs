@@ -1,0 +1,506 @@
+use crate::abi::{self, FunctionAbi};
+use crate::bytecode::BytecodeBuilder;
+use crate::layout::{StorageLayout};
+use crate::opcodes::Opcode;
+use oxyde_parser::typing::{Arg, Mutability};
+use syn::{Expr, ImplItem, ImplItemFn, ItemImpl, ItemStruct, Stmt};
+
+pub struct CompiledContract {
+    pub name: String,
+    pub runtime_bytecode: Vec<u8>,
+    pub creation_bytecode: Vec<u8>,
+    pub functions: Vec<FunctionAbi>,
+    pub constructor: Option<FunctionAbi>,
+    pub layout: StorageLayout,
+}
+
+pub fn compile(
+    contract_struct: &ItemStruct,
+    contract_impl: &ItemImpl,
+) -> Result<CompiledContract, String> {
+    let name = contract_struct.ident.to_string();
+    let layout = StorageLayout::from_struct(contract_struct)?;
+
+    // Collect public methods from impl
+    let methods: Vec<&ImplItemFn> = contract_impl
+        .items
+        .iter()
+        .filter_map(|item| {
+            if let ImplItem::Fn(method) = item {
+                if matches!(method.vis, syn::Visibility::Public(_)) {
+                    return Some(method);
+                }
+            }
+            None
+        })
+        .collect();
+
+    let constructor_method = methods.iter().find(|m| m.sig.ident == "constructor").copied();
+    let regular_methods: Vec<&ImplItemFn> = methods
+        .iter()
+        .filter(|m| m.sig.ident != "constructor")
+        .copied()
+        .collect();
+
+    // Build FunctionAbi for each regular method
+    let mut function_abis: Vec<FunctionAbi> = Vec::new();
+    for method in &regular_methods {
+        let method_args = extract_typed_args(method);
+
+        let output_type = match &method.sig.output {
+            syn::ReturnType::Default => None,
+            syn::ReturnType::Type(_, ty) => Some(abi::syn_type_to_string(ty)),
+        };
+
+        let mutability = infer_mutability(method);
+
+        let fabi = FunctionAbi::new(
+            &method.sig.ident.to_string(),
+            &method_args,
+            output_type.as_deref(),
+            mutability,
+        )?;
+        function_abis.push(fabi);
+    }
+
+    // Build constructor ABI if present
+    let constructor_abi = if let Some(ctor) = constructor_method {
+        let ctor_args = extract_typed_args(ctor);
+        Some(FunctionAbi::new(
+            "constructor",
+            &ctor_args,
+            None,
+            Mutability::Mutable,
+        )?)
+    } else {
+        None
+    };
+
+    // --- Compile runtime bytecode ---
+    let mut runtime = BytecodeBuilder::new();
+
+    // Selector dispatch preamble: load 4-byte selector from calldata
+    // PUSH1 0x00, CALLDATALOAD, PUSH1 0xe0, SHR
+    runtime.emit_push_u8(0x00);
+    runtime.emit(Opcode::CallDataLoad);
+    runtime.emit_push_u8(0xe0);
+    runtime.emit(Opcode::LogicalRightShift);
+
+    // Create labels and emit dispatch table
+    let mut func_labels = Vec::new();
+    for fabi in &function_abis {
+        let label = runtime.create_label();
+        runtime.emit(Opcode::Dup(1));
+        runtime.emit_push_u32(u32::from_be_bytes(fabi.selector));
+        runtime.emit(Opcode::Eq);
+        runtime.emit_jumpi(label);
+        func_labels.push(label);
+    }
+
+    // Fallback: revert
+    runtime.emit_push_u8(0x00);
+    runtime.emit_push_u8(0x00);
+    runtime.emit(Opcode::Revert);
+
+    // Compile each function body
+    for (i, method) in regular_methods.iter().enumerate() {
+        runtime.place_label(func_labels[i]);
+        runtime.emit(Opcode::Pop); // remove the selector copy
+        compile_function(&mut runtime, method, &layout)?;
+    }
+
+    let runtime_bytecode = runtime.finalize();
+
+    // --- Compile creation bytecode ---
+    let creation_bytecode = if let Some(ctor) = constructor_method {
+        let ctor_args = extract_typed_args(ctor);
+        compile_creation_code(&runtime_bytecode, &ctor_args, &layout)?
+    } else {
+        BytecodeBuilder::emit_creation_code(&runtime_bytecode)
+    };
+
+    Ok(CompiledContract {
+        name,
+        runtime_bytecode,
+        creation_bytecode,
+        functions: function_abis,
+        constructor: constructor_abi,
+        layout,
+    })
+}
+
+// ---- Helper: extract non-receiver args from a method ----
+
+fn extract_typed_args(method: &ImplItemFn) -> Vec<Arg> {
+    method
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            if let syn::FnArg::Typed(pat_type) = input {
+                let name = if let syn::Pat::Ident(ident) = &*pat_type.pat {
+                    Some(ident.ident.clone())
+                } else {
+                    None
+                };
+                Some(Arg {
+                    name,
+                    r#type: (*pat_type.ty).clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+// ---- Helper: infer mutability from receiver ----
+
+fn infer_mutability(method: &ImplItemFn) -> Mutability {
+    for input in &method.sig.inputs {
+        if let syn::FnArg::Receiver(r) = input {
+            return if r.mutability.is_some() {
+                Mutability::Mutable
+            } else {
+                Mutability::View
+            };
+        }
+    }
+    Mutability::Pure
+}
+
+// ---- Compile a single function body into the builder ----
+
+fn compile_function(
+    b: &mut BytecodeBuilder,
+    method: &ImplItemFn,
+    layout: &StorageLayout,
+) -> Result<(), String> {
+    let args = extract_typed_args(method);
+    let stmts = &method.block.stmts;
+    let has_return = !matches!(method.sig.output, syn::ReturnType::Default);
+
+    for (i, stmt) in stmts.iter().enumerate() {
+        let is_last = i == stmts.len() - 1;
+        match stmt {
+            Stmt::Expr(expr, semi) => {
+                compile_expr(b, expr, layout, &args)?;
+
+                if is_last && semi.is_none() && has_return {
+                    // Last expression without semicolon is the return value.
+                    // Store at memory[0] and return 32 bytes.
+                    b.emit_push_u8(0x00);
+                    b.emit(Opcode::MStore);
+                    b.emit_push_u8(0x20);
+                    b.emit_push_u8(0x00);
+                    b.emit(Opcode::Return);
+                }
+                // Expression statements that produce a value (e.g. a set() call that
+                // leaves nothing on the stack) need no extra handling for the MVP.
+            }
+            _ => return Err("unsupported statement type".to_string()),
+        }
+    }
+
+    if !has_return {
+        b.emit(Opcode::Stop);
+    }
+
+    Ok(())
+}
+
+// ---- Recursive expression compiler ----
+
+fn compile_expr(
+    b: &mut BytecodeBuilder,
+    expr: &Expr,
+    layout: &StorageLayout,
+    args: &[Arg],
+) -> Result<(), String> {
+    match expr {
+        Expr::MethodCall(mc) => {
+            if let Some(field_name) = get_self_field_name(&mc.receiver) {
+                let field = layout
+                    .get_field(&field_name)
+                    .ok_or_else(|| format!("unknown field: {field_name}"))?;
+                match mc.method.to_string().as_str() {
+                    "get_value" => {
+                        b.emit_push_usize(field.slot as usize);
+                        b.emit(Opcode::SLoad);
+                    }
+                    "set" => {
+                        let val_expr = mc
+                            .args
+                            .first()
+                            .ok_or_else(|| "set() requires one argument".to_string())?;
+                        compile_expr(b, val_expr, layout, args)?;
+                        b.emit_push_usize(field.slot as usize);
+                        b.emit(Opcode::SStore);
+                    }
+                    other => return Err(format!("unsupported method: {other}")),
+                }
+            } else {
+                return Err("unsupported method call receiver".to_string());
+            }
+        }
+
+        Expr::Binary(bin) => {
+            compile_expr(b, &bin.left, layout, args)?;
+            compile_expr(b, &bin.right, layout, args)?;
+            match bin.op {
+                syn::BinOp::Add(_) => b.emit(Opcode::Add),
+                syn::BinOp::Sub(_) => b.emit(Opcode::Sub),
+                syn::BinOp::Mul(_) => b.emit(Opcode::Mul),
+                syn::BinOp::Div(_) => b.emit(Opcode::Div),
+                _ => return Err("unsupported binary operator".to_string()),
+            }
+        }
+
+        Expr::Call(call) => {
+            if is_u256_from(call) {
+                if let Some(inner) = call.args.first() {
+                    compile_expr(b, inner, layout, args)?;
+                } else {
+                    return Err("U256::from() requires one argument".to_string());
+                }
+            } else {
+                return Err("unsupported function call".to_string());
+            }
+        }
+
+        Expr::Path(path) => {
+            let name = path
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            if let Some(idx) = args
+                .iter()
+                .position(|a| a.name.as_ref().map(|n| n.to_string()) == Some(name.clone()))
+            {
+                b.emit_push_usize(4 + idx * 32);
+                b.emit(Opcode::CallDataLoad);
+            } else {
+                return Err(format!("unknown variable: {name}"));
+            }
+        }
+
+        Expr::Lit(lit) => {
+            if let syn::Lit::Int(int_lit) = &lit.lit {
+                let val: u64 = int_lit.base10_parse().map_err(|e: syn::Error| e.to_string())?;
+                b.emit_push_usize(val as usize);
+            } else {
+                return Err("unsupported literal type".to_string());
+            }
+        }
+
+        Expr::Paren(paren) => {
+            compile_expr(b, &paren.expr, layout, args)?;
+        }
+
+        _ => return Err("unsupported expression kind".to_string()),
+    }
+    Ok(())
+}
+
+// ---- Helpers for expression pattern recognition ----
+
+/// If expr is `self.<field>`, returns the field name.
+fn get_self_field_name(expr: &Expr) -> Option<String> {
+    if let Expr::Field(field_expr) = expr {
+        if let Expr::Path(path) = &*field_expr.base {
+            if path.path.is_ident("self") {
+                if let syn::Member::Named(ident) = &field_expr.member {
+                    return Some(ident.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Returns true if the call is `U256::from(...)`.
+fn is_u256_from(call: &syn::ExprCall) -> bool {
+    if let Expr::Path(path) = &*call.func {
+        let segs: Vec<_> = path.path.segments.iter().collect();
+        if segs.len() == 2 {
+            return segs[0].ident == "U256" && segs[1].ident == "from";
+        }
+    }
+    false
+}
+
+// ---- Creation code builder ----
+
+/// Returns the byte-size of `emit_push_usize(val)`.
+fn push_usize_size(val: usize) -> usize {
+    if val == 0 {
+        1 // PUSH0
+    } else if val < 0x100 {
+        2 // PUSH1 + 1 byte
+    } else if val < 0x10000 {
+        3 // PUSH2 + 2 bytes
+    } else if val < 0x1000000 {
+        4 // PUSH3 + 3 bytes
+    } else {
+        5 // PUSH4 + 4 bytes
+    }
+}
+
+fn compile_creation_code(
+    runtime_bytecode: &[u8],
+    constructor_args: &[Arg],
+    _layout: &StorageLayout,
+) -> Result<Vec<u8>, String> {
+    let num_args = constructor_args.len();
+    let total_args_size = num_args * 32;
+    let runtime_len = runtime_bytecode.len();
+
+    let mut b = BytecodeBuilder::new();
+
+    if num_args > 0 {
+        // Copy all constructor args to memory at 0x80.
+        // Args are ABI-encoded and appended after the creation code by the deployer.
+        // CODESIZE gives total code length including appended args.
+        // Stack layout before CODECOPY: [0x80(top/destOffset), (CODESIZE-args_size)(offset), args_size(size)]
+        // EVM SUB: a - b where a=TOS, b=next; to get CODESIZE-args_size we need CODESIZE on top.
+        b.emit_push_usize(total_args_size); // size (stays at bottom)
+        b.emit_push_usize(total_args_size); // will be subtracted from CODESIZE
+        b.emit(Opcode::CodeSize); // CODESIZE on top (= a for SUB)
+        b.emit(Opcode::Sub); // offset = CODESIZE - args_size
+        b.emit_push_u8(0x80); // dest in memory
+        b.emit(Opcode::CodeCopy);
+
+        // Store each arg into its corresponding storage slot (by convention: arg i → slot i).
+        for i in 0..num_args {
+            let mem_offset = 0x80_usize + i * 32;
+            b.emit_push_usize(mem_offset);
+            b.emit(Opcode::MLoad); // value on stack
+            b.emit_push_usize(i); // slot
+            b.emit(Opcode::SStore);
+        }
+    }
+
+    // Emit the "return runtime code" sequence.
+    // We need to know the offset of the runtime code within the creation deployment,
+    // which equals: (bytes emitted so far) + (size of the return sequence itself).
+    //
+    // The return sequence is:
+    //   emit_push_usize(runtime_len)  [push_usize_size(runtime_len) bytes]
+    //   emit_push_u16(offset as u16)  [3 bytes — always PUSH2]
+    //   emit_push_u8(0x00)            [2 bytes]
+    //   CODECOPY                      [1 byte]
+    //   emit_push_usize(runtime_len)  [push_usize_size(runtime_len) bytes]
+    //   emit_push_u8(0x00)            [2 bytes]
+    //   RETURN                        [1 byte]
+    //
+    // Total = push_usize_size(runtime_len)*2 + 3 + 2 + 1 + 2 + 1
+    //       = push_usize_size(runtime_len)*2 + 9
+    //
+    // We use PUSH2 for the offset so its size is always fixed at 3 bytes.
+    let body_len = b.len();
+    let return_seq_len = push_usize_size(runtime_len) * 2 + 9;
+    let runtime_offset = body_len + return_seq_len;
+
+    b.emit_push_usize(runtime_len);
+    b.emit_push_u16(runtime_offset as u16);
+    b.emit_push_u8(0x00);
+    b.emit(Opcode::CodeCopy);
+    b.emit_push_usize(runtime_len);
+    b.emit_push_u8(0x00);
+    b.emit(Opcode::Return);
+
+    assert_eq!(
+        b.len(),
+        runtime_offset,
+        "creation code offset mismatch: expected {runtime_offset}, got {}",
+        b.len()
+    );
+
+    let mut creation = b.finalize();
+    creation.extend_from_slice(runtime_bytecode);
+    Ok(creation)
+}
+
+// ---- Tests ----
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compile_counter_contract() {
+        let contract_struct: syn::ItemStruct = syn::parse_quote! {
+            pub struct Counter {
+                pub value: StorageItem<U256>,
+            }
+        };
+
+        let contract_impl: syn::ItemImpl = syn::parse_quote! {
+            impl Counter {
+                pub fn constructor(initial: U256) -> Self {
+                    Counter { value: StorageItem::new_with_value("value", initial) }
+                }
+                pub fn get_value(&self) -> U256 {
+                    self.value.get_value()
+                }
+                pub fn increment(&mut self) {
+                    self.value.set(self.value.get_value() + U256::from(1))
+                }
+            }
+        };
+
+        let result = compile(&contract_struct, &contract_impl);
+        assert!(result.is_ok(), "compilation failed: {:?}", result.err());
+
+        let compiled = result.unwrap();
+        assert_eq!(compiled.name, "Counter");
+        assert_eq!(compiled.functions.len(), 2); // get_value + increment
+        assert!(compiled.constructor.is_some());
+        assert!(!compiled.runtime_bytecode.is_empty());
+        assert!(!compiled.creation_bytecode.is_empty());
+
+        // Runtime bytecode starts with selector dispatch:
+        // PUSH1 0x00 = 0x60 0x00
+        assert_eq!(compiled.runtime_bytecode[0], 0x60); // PUSH1
+        assert_eq!(compiled.runtime_bytecode[1], 0x00);
+        assert_eq!(compiled.runtime_bytecode[2], 0x35); // CALLDATALOAD
+    }
+
+    #[test]
+    fn compile_no_constructor() {
+        let contract_struct: syn::ItemStruct = syn::parse_quote! {
+            pub struct Simple {
+                pub count: StorageItem<U256>,
+            }
+        };
+
+        let contract_impl: syn::ItemImpl = syn::parse_quote! {
+            impl Simple {
+                pub fn get_count(&self) -> U256 {
+                    self.count.get_value()
+                }
+            }
+        };
+
+        let result = compile(&contract_struct, &contract_impl);
+        assert!(result.is_ok(), "compilation failed: {:?}", result.err());
+
+        let compiled = result.unwrap();
+        assert!(compiled.constructor.is_none());
+        assert_eq!(compiled.functions.len(), 1);
+        // When no constructor, emit_creation_code is used
+        assert!(compiled.creation_bytecode.ends_with(&compiled.runtime_bytecode));
+    }
+
+    #[test]
+    fn push_usize_size_correct() {
+        assert_eq!(push_usize_size(0), 1);
+        assert_eq!(push_usize_size(1), 2);
+        assert_eq!(push_usize_size(255), 2);
+        assert_eq!(push_usize_size(256), 3);
+        assert_eq!(push_usize_size(0xffff), 3);
+        assert_eq!(push_usize_size(0x10000), 4);
+    }
+}
